@@ -1,0 +1,128 @@
+import torch
+import numpy as np
+import math
+from torch.autograd import Variable
+from sklearn.preprocessing import MinMaxScaler
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+
+class my_lstm(torch.nn.Module):
+    def __init__(self, input_dims, sequence_length, cell_size):
+        super(my_lstm, self).__init__()
+        self.lstm = torch.nn.LSTMCell(input_dims, cell_size)
+        self.sequence_length = sequence_length
+        self.cell_size = cell_size
+
+    def forward(self, input):
+
+        ht = Variable(torch.zeros(input.size(1), self.cell_size), requires_grad=False)
+        ct = Variable(torch.zeros(input.size(1), self.cell_size), requires_grad=False)
+
+        outputs = []
+
+        for _, input_t in enumerate(input.chunk(self.sequence_length)):
+            ht, ct = self.lstm(torch.squeeze(input_t), (ht, ct))
+            outputs.append(ht)
+
+        return torch.stack(outputs).squeeze()
+
+
+def generateSet(input_dims, sequence_length, time_steps, minibatch_size, test_percent):
+
+    random_x = np.linspace(0, time_steps, time_steps)
+
+    rows = []
+    for i in range(input_dims):
+        rows.append(np.sin(random_x / (i + 1) + i).reshape(time_steps, 1))
+
+    data = np.concatenate(rows, axis=1)
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    data = scaler.fit_transform(data)
+
+    input = Variable(torch.FloatTensor(data))
+
+    # cut ( input_dims , time ) into batches of ( sequence_length,  batch_size, input_dims )
+    input = input.split(sequence_length)
+
+    # remove last element in batch in case its not full sized
+    input = input[:-1]
+
+    # separate the list into mini_batches
+    batches = []
+    pos = 0
+    while pos + minibatch_size < len(input):
+        batches.append(torch.stack(input[pos:pos + minibatch_size], dim=1))
+        pos += minibatch_size
+
+    # split into training and test sets
+    test_size = math.floor(len(batches) * test_percent / 100)
+    train = batches[0:-test_size]
+    test = batches[-test_size:]
+
+    return train, test
+
+
+class Batches:
+    def __init__(self, batches, target_input):
+        self.batches = batches
+        self.pos = 0
+        self.target_input = target_input
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pos < len(self.batches):
+            minibatch = self.batches[self.pos]
+            target = minibatch[:, :, self.target_input]
+            self.pos += 1
+            return minibatch, target
+        else:
+            raise StopIteration
+
+    def __len__(self):
+        return self.batches.len()
+
+
+sequence_length = 30
+input_dims = 5
+cell_size = 1
+time_steps = 10000
+minibatch_size = 5
+target_input = 1
+
+# init Tensorboard
+tensorboard_step = 0
+writer = SummaryWriter(comment="LSTM Cell")
+
+lstm = my_lstm(input_dims, sequence_length, cell_size)
+train, test = generateSet(input_dims, sequence_length, time_steps, minibatch_size, 10)
+
+criterion = torch.nn.MSELoss()
+optimiser = torch.optim.Adagrad(lstm.parameters(), lr=0.01)
+
+for i in range(10):
+
+    # train
+    for minibatch, target in tqdm(Batches(train, target_input), total=len(train)):
+
+        def training_step():
+            optimiser.zero_grad()
+            output = lstm(minibatch)
+            loss = criterion(output, target)
+            loss.backward()
+            global tensorboard_step
+            tensorboard_step += 1
+            writer.add_scalar('training loss', loss, tensorboard_step)
+            return loss
+
+        loss = optimiser.step(closure=training_step).data
+
+    # test
+    for minibatch, target in tqdm(Batches(test, target_input), total=len(test)):
+
+        output = lstm(minibatch)
+        loss = criterion(output, target)
+        tensorboard_step += 1
+        writer.add_scalar('test loss', loss, tensorboard_step)
