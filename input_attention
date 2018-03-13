@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import math
+from torch.autograd import Variable
+from sklearn.preprocessing import MinMaxScaler
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+
+
+class DSARNN(torch.nn.Module):
+    def __init__(self, input_dims, sequence_length, cell_size):
+        super(DSARNN, self).__init__()
+
+        self.sequence_length = sequence_length
+        self.cell_size = cell_size
+
+        # attention over inputs
+        self.We = nn.Linear(cell_size * 2, input_dims)
+        self.Ue = nn.Linear(input_dims, input_dims)  # this should be input_dims, 1
+        self.tanh = nn.Tanh()
+        self.relu = nn.ReLU()
+        self.Ve = nn.Linear(input_dims, input_dims)
+        self.softmax = nn.Softmax(dim=1)
+
+        # encoder
+        self.lstm1 = nn.LSTMCell(input_dims, cell_size)
+
+        # attention over encoded timesteps
+        self.Wd = nn.Linear(cell_size * 2, sequence_length)
+        self.Ud = nn.Linear(cell_size * sequence_length, sequence_length)
+        self.Vd = nn.Linear(sequence_length, sequence_length)
+        self.tanh_time = nn.Tanh()
+        self.relu_time = nn.ReLU()
+        self.softmax_time = nn.Softmax(dim=1)
+
+        # decoder
+        self.decoder = nn.LSTMCell(self.cell_size, self.cell_size)
+        self.linear = nn.Linear(self.cell_size, 1)
+
+    def forward(self, input):
+
+        ht = Variable(torch.zeros(input.size(1), self.cell_size), requires_grad=False)
+        ct = Variable(torch.zeros(input.size(1), self.cell_size), requires_grad=False)
+
+        outputs = []
+
+        for _, raw_input_t in enumerate(input.chunk(self.sequence_length)):
+
+            input_t = torch.squeeze(raw_input_t)
+
+            # attention over inputs
+            U = self.Ue(input_t)
+            W = self.We(torch.cat((ht, ct), dim=1))
+            A = self.relu(torch.add(U, W))
+            V = self.Ve(A)
+            alpha = self.softmax(V)
+
+            inputWithAttention = input_t * alpha
+
+            ht, ct = self.lstm1(inputWithAttention, (ht, ct))
+            outputs.append(ht)
+
+        return torch.stack(outputs).squeeze()
+
+
+def monitorAttention(self, input, output):
+    global tensorboard_step
+    # input is a tuple of packed inputs
+    # output is a Variable. output.data is the Tensor we are interested
+    for i in range(output.data.size()[1]):
+        writer.add_scalar('data/attention_' + str(i), output.data[0, i], tensorboard_step)
+
+
+def generateSet(input_dims, sequence_length, time_steps, minibatch_size, test_percent):
+
+    line = np.linspace(0, time_steps, time_steps)
+
+    rows = []
+    #for i in range(input_dims):
+    rows.append(np.random.randn(time_steps).reshape(time_steps, 1))
+    rows.append(np.sin(line/6.0).reshape(time_steps, 1))
+
+
+    data = np.concatenate(rows, axis=1)
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    data = scaler.fit_transform(data)
+
+    input = Variable(torch.FloatTensor(data))
+
+    # cut ( input_dims , time ) into batches of ( sequence_length,  batch_size, input_dims )
+    input = input.split(sequence_length)
+
+    # remove last element in batch in case its not full sized
+    input = input[:-1]
+
+    # separate the list into mini_batches
+    batches = []
+    pos = 0
+    while pos + minibatch_size < len(input):
+        batches.append(torch.stack(input[pos:pos + minibatch_size], dim=1))
+        pos += minibatch_size
+
+    # split into training and test sets
+    test_size = math.floor(len(batches) * test_percent / 100)
+    train = batches[0:-test_size]
+    test = batches[-test_size:]
+
+    return train, test
+
+
+class Batches:
+    def __init__(self, batches, target_input):
+        self.batches = batches
+        self.pos = 0
+        self.target_input = target_input
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pos < len(self.batches):
+            minibatch = self.batches[self.pos]
+            target = minibatch[:, :, self.target_input]
+            self.pos += 1
+            return minibatch, target
+        else:
+            raise StopIteration
+
+    def __len__(self):
+        return self.batches.len()
+
+
+sequence_length = 30
+input_dims = 2
+cell_size = 1
+time_steps = 40000
+minibatch_size = 20
+target_input = 1
+
+train, test = generateSet(input_dims, sequence_length, time_steps, minibatch_size, 10)
+
+for run in range(3):
+
+    lstm = DSARNN(input_dims, sequence_length, cell_size)
+    criterion = torch.nn.MSELoss()
+    optimiser = torch.optim.Adagrad(lstm.parameters(), lr=0.01)
+
+    # register hooks
+
+    lstm.softmax.register_forward_hook(monitorAttention)
+
+    # init Tensorboard
+    tensorboard_step = 0
+    writer = SummaryWriter(comment="LSTM Cell + input attention with BatchNorm")
+
+    for epoch in range(50):
+
+        # train
+        for minibatch, target in tqdm(Batches(train, target_input), total=len(train)):
+
+            def training_step():
+                optimiser.zero_grad()
+                output = lstm(minibatch)
+                loss = criterion(output, target)
+                loss.backward()
+                global tensorboard_step
+                tensorboard_step += 1
+                writer.add_scalar('training loss', loss, tensorboard_step)
+                return loss
+
+            loss = optimiser.step(closure=training_step).data
+
+        # test
+        for minibatch, target in tqdm(Batches(test, target_input), total=len(test)):
+
+            output = lstm(minibatch)
+            loss = criterion(output, target)
+            tensorboard_step += 1
+            writer.add_scalar('test loss', loss, tensorboard_step)
